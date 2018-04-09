@@ -12,6 +12,13 @@ const io = std.io;
 
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
+const InStream = io.InStream;
+const OutStream = io.OutStream;
+
+const custom_stream = @import("stream.zig");
+const SlidingWindowOutStream = custom_stream.SlidingWindowOutStream;
+const MemoryInStream = custom_stream.MemoryInStream;
+const MemoryOutStream = custom_stream.MemoryOutStream;
 
 // Maximum bits in a huffman code.
 const max_bits = 15;
@@ -25,7 +32,7 @@ const max_codes = max_lcodes + max_dcodes;
 const fix_lcodes = 288;
 
 const HuffmanTable = struct {
-    // Number of symbols of each length
+    // Number of symbols of ordered by length [1..15]
     count: [max_bits + 1]u16,
     // Symbols ordered by length in the huffman tree
     symbol: [max_codes]u16,
@@ -89,33 +96,34 @@ const HuffmanTable = struct {
     }
 };
 
-const custom_stream = @import("stream.zig");
-
-// comptime here for errors is slightly ugly, it would be great if we didn't need this and could
-// just runtime switch.
-pub fn InflateState(comptime InError: type, comptime OutError: type, comptime HashFunction: var) type {
+pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Hasher: var) type {
     return struct {
         const Self = this;
-        const SlidingWindow = custom_stream.SlidingWindowOutStream(OutError, 1 << 15);
 
-        // Output stream which keeps a 32K sliding window for RLE decoding.
-        // TODO: Store the stream instance instead.
-        output: SlidingWindow,
+        // Output stream wrapper which keeps a 32K sliding window for RLE decoding.
+        const InflateSlidingWindow = SlidingWindowOutStream(OutError, 1 << 15);
 
-        input: &io.InStream(InError),
-        read_count: usize,
+        wrapped_out_stream: InflateSlidingWindow,
+        out_stream: &OutStream(OutError),
+        hasher: Hasher,
 
-        hashfn: HashFunction,
+        in_stream: &InStream(InError),
+        in_count: usize,
 
         bit_buffer: u16,
         bit_count: u8,
 
-        pub fn init(in_stream: &io.InStream(InError), out_stream: &io.OutStream(OutError)) Self {
+        pub fn init(in_stream: &InStream(InError), out_stream: &OutStream(OutError)) Self {
+            var wrapped_out_stream = InflateSlidingWindow.init(out_stream);
+
             return Self {
-                .output = SlidingWindow.init(out_stream),
-                .input = in_stream,
-                .read_count = 0,
-                .hashfn = HashFunction.init(),
+                .wrapped_out_stream = wrapped_out_stream,
+                .out_stream = &wrapped_out_stream.stream,
+                .hasher = Hasher.init(),
+
+                .in_stream = in_stream,
+                .in_count = 0,
+
                 .bit_buffer = 0,
                 .bit_count = 0,
             };
@@ -126,11 +134,10 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
             var val = state.bit_buffer;
             while (state.bit_count < need) {
                 var b: [1]u8 = undefined;
-                _ = try state.input.read(b[0..]);
-                state.read_count += 1;
+                _ = try state.in_stream.read(b[0..]);
+                state.in_count += 1;
 
                 val |= math.shl(u16, b[0], state.bit_count);
-                state.read_count += 1;
                 state.bit_count += 8;
             }
 
@@ -221,8 +228,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
                 }
 
                 var b: [1]u8 = undefined;
-                try state.input.read(b[0..]);
-                state.read_count += 1;
+                try state.in_stream.read(b[0..]);
+                state.in_count += 1;
 
                 bit_buffer = b[0];
 
@@ -272,8 +279,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
                 // literal
                 if (symbol < 256) {
                     var b: [1] u8 = []u8 { u8(symbol) };
-                    state.hashfn.update(b[0..]);
-                    try state.output.stream.write(b[0..]);
+                    try state.out_stream.write(b[0..]);
+                    state.hasher.update(b[0..]);
                 }
                 // length
                 else if (symbol > 256) {
@@ -291,11 +298,11 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
                     const dist = dists[symbol] + try state.readBits(dext[symbol]);
 
                     // Lookback into the output sliding window for the matching run
-                    const slice = state.output.windowSlice();
+                    const slice = state.wrapped_out_stream.windowSlice();
                     const symbol_slice = slice[slice.len - dist .. slice.len - dist + len];
 
-                    state.hashfn.update(symbol_slice);
-                    try state.output.stream.write(symbol_slice);
+                    try state.out_stream.write(symbol_slice);
+                    state.hasher.update(symbol_slice);
                 }
                 // end of block
                 else {
@@ -311,8 +318,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
             state.bit_count = 0;
 
             var b: [4]u8 = undefined;
-            _ = try state.input.read(b[0..]);
-            state.read_count += 4;
+            _ = try state.in_stream.read(b[0..]);
+            state.in_count += 4;
 
             const l1 = b[0];
             const l2 = b[1];
@@ -330,11 +337,11 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
             // TODO: do in chunks of os page size.
             while (i < len) : (i += 1) {
                 var b2: [1]u8 = undefined;
-                _ = try state.input.read(b2[0..]);
-                state.read_count += 1;
+                _ = try state.in_stream.read(b2[0..]);
+                state.in_count += 1;
 
-                state.hashfn.update(b2[0..]);
-                try state.output.stream.write(b2[0..]);
+                try state.out_stream.write(b2[0..]);
+                state.hasher.update(b2[0..]);
             }
         }
 
@@ -378,8 +385,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
             return state.decodeBlock(&literal_table, &distance_table);
         }
 
-        // A dynamic block has the huffman tables embedded at the beginning. These tables are generated
-        // by the encoder to be as optimal as possible for each block.
+        // A dynamic block has the huffman tables embedded at the beginning. These tables are
+        // generated by the encoder to be as optimal as possible for each block.
         pub fn decodeDynamic(state: &Self) !void {
             const order: [19]u16 = []const u16 {
                 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
@@ -479,8 +486,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
 
 pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
                   comptime OutError: type, out_stream: &io.OutStream(OutError),
-                  comptime HashFunction: var) !u32 {
-    const InflateStateImpl = InflateState(InError, OutError, HashFunction);
+                  comptime Hasher: var) !u32 {
+    const InflateStateImpl = InflateState(InError, OutError, Hasher);
     var state = InflateStateImpl.init(in_stream, out_stream);
 
     while (true) {
@@ -501,18 +508,18 @@ pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
         }
     }
 
-    return state.hashfn.final();
+    return state.hasher.final();
 }
 
-pub fn decompressAlloc(allocator: &Allocator, input: []const u8, comptime HashFunction: var) !ArrayList(u8) {
+pub fn decompressAlloc(allocator: &Allocator, input: []const u8, comptime Hasher: var) !ArrayList(u8) {
     var buffer = ArrayList(u8).init(allocator);
     errdefer buffer.deinit();
 
-    var in_stream = custom_stream.MemoryInStream.init(input);
-    var out_stream = custom_stream.GrowableMemoryOutStream.init(&buffer);
+    var in_stream = MemoryInStream.init(input);
+    var out_stream = MemoryOutStream.init(&buffer);
 
-    _ = try decompress(custom_stream.MemoryInStream.Error, &in_stream.stream,
-                   custom_stream.GrowableMemoryOutStream.Error, &out_stream.stream, HashFunction);
+    _ = try decompress(MemoryInStream.Error, &in_stream.stream,
+                       MemoryOutStream.Error, &out_stream.stream, Hasher);
 
     return buffer;
 }

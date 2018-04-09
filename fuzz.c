@@ -10,7 +10,7 @@
 #include <zlib.h>
 
 // points to a static buffer valid till next call
-extern int zig_decompress(const uint8_t *input, size_t inlen, uint8_t **output, size_t *outlen);
+extern int zig_decompress(const uint8_t *input, size_t inlen, uint8_t *output, size_t *outlen);
 
 void print_buffer(const uint8_t *buf, size_t len)
 {
@@ -53,9 +53,9 @@ int main(void)
         // zlib stream headers.
         // Cut these out (2 byte header), (4 byte checksum).
 
-        uint8_t *decomp_output;
+        uint8_t decomp_output[8192];
         size_t decomp_out_len;
-        if ((r = zig_decompress(out_buffer + 2, out_len - 6, &decomp_output, &decomp_out_len)) != 0) {
+        if ((r = zig_decompress(out_buffer + 2, out_len - 6, decomp_output, &decomp_out_len)) != 0) {
             fprintf(stderr, "bad zig_decompress (%d)\n", r);
             abort();
         }
