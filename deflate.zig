@@ -7,9 +7,10 @@ const std = @import("std");
 const debug = std.debug;
 const math = std.math;
 const mem = std.mem;
+const io = std.io;
 
 const Allocator = mem.Allocator;
-const ArrayList = std.ArrayList;
+const Buffer = std.Buffer;
 
 // Maximum bits in a huffman code.
 const max_bits = 15;
@@ -87,98 +88,78 @@ const HuffmanTable = struct {
     }
 };
 
-pub const InflateState = struct {
-    output: ArrayList(u8),
+const custom_stream = @import("stream.zig");
 
-    input: []const u8,
-    read_count: usize,
-    bit_buffer: u16,
-    bit_count: u8,
+// comptime here for errors is slightly ugly, it would be great if we didn't need this and could
+// just runtime switch.
+pub fn InflateState(comptime InError: type, comptime OutError: type) type {
+    return struct {
+        const Self = this;
+        const SlidingWindow = SlidingWindowOutStream(OutError, 1 << 15);
 
-    // Read individual unaligned bits from the input stream.
-    pub fn readBits(state: &InflateState, need: u4) !u16 {
-        var val = state.bit_buffer;
-        while (state.bit_count < need) {
-            if (state.read_count == state.input.len) {
-                return error.OutOfInput;
-            }
+        // Output stream which keeps a 32K sliding window for RLE decoding.
+        output: SlidingWindow,
 
-            val |= math.shl(u16, state.input[state.read_count], state.bit_count);
-            state.read_count += 1;
-            state.bit_count += 8;
+        input: io.InStream(InError),
+        read_count: usize,
+
+        bit_buffer: u16,
+        bit_count: u8,
+
+        pub fn init(in_stream: io.InStream(Error), out_stream: io.OutStream(Error)) Self {
+            return Self {
+                .output = SlidingWindow.init(&out_stream),
+                .input = in_stream,
+                .read_count = 0,
+                .bit_buffer = 0,
+                .bit_count = 0,
+            };
         }
 
-        state.bit_buffer = val >> need;
-        state.bit_count -= need;
+        // Read individual unaligned bits from the input stream.
+        pub fn readBits(state: &Self, need: u4) !u16 {
+            var val = state.bit_buffer;
+            while (state.bit_count < need) {
+                var b: [1]u8 = undefined;
+                try state.input.read(b[0..]);
+                state.read_count += 1;
 
-        return u16(val & ((u16(1) << need) - 1));
-    }
-
-    // Read a byte without error. Assumes there is sufficient bytes on the stream.
-    pub fn readByte(state: &InflateState) u8 {
-        return u8(state.readBits(8) catch unreachable);
-    }
-
-    // Decode a single huffman code using the specified table from the stream.
-    //
-    // TODO: Use fast version.
-    pub fn decode(state: &InflateState, huffman_table: &const HuffmanTable) !u16 {
-        // number of bits being decoded
-        var code: u16 = 0;
-        // first code of length len
-        var first: u16 = 0;
-        // number of codes of length len
-        var count: u16 = 0;
-        // index of first code of length len in symbol table
-        var index: usize = 0;
-
-        var len: usize = 1;
-        while (len <= max_bits) : (len += 1) {
-            code |= try state.readBits(1);
-            count = huffman_table.count[len];
-
-            // ugly casts
-            if (i32(code) - i32(count) < i32(first)) {
-                return huffman_table.symbol[usize(i32(index) + i32(code) - i32(first))];
+                val |= math.shl(u16, b[0], state.bit_count);
+                state.read_count += 1;
+                state.bit_count += 8;
             }
 
-            index += count;
-            first += count;
-            first <<= 1;
-            code <<= 1;
+            state.bit_buffer = val >> need;
+            state.bit_count -= need;
+
+            return u16(val & ((u16(1) << need) - 1));
         }
 
-        return error.RanOutOfHuffmanCodes;
-    }
+        // Read a byte without error. Assumes there is sufficient bytes on the stream.
+        pub fn readByte(state: &Self) u8 {
+            return u8(state.readBits(8) catch unreachable);
+        }
 
-    pub fn decode2(state: &InflateState, huffman_table: &const HuffmanTable) !u16 {
-        // number of bits being decoded
-        var code: u16 = 0;
-        // first code of length len
-        var first: u16 = 0;
-        // number of codes of length len
-        var count: u16 = 0;
-        // index of first code of length len in symbol table
-        var index: usize = 0;
+        // Decode a single huffman code using the specified table from the stream.
+        //
+        // TODO: Use fast version.
+        pub fn decode(state: &InflateState, huffman_table: &const HuffmanTable) !u16 {
+            // number of bits being decoded
+            var code: u16 = 0;
+            // first code of length len
+            var first: u16 = 0;
+            // number of codes of length len
+            var count: u16 = 0;
+            // index of first code of length len in symbol table
+            var index: usize = 0;
 
-        var bit_buffer = state.bit_buffer;
-        var left = state.bit_count;
+            var len: usize = 1;
+            while (len <= max_bits) : (len += 1) {
+                code |= try state.readBits(1);
+                count = huffman_table.count[len];
 
-        var next_pos: usize = 1;
-        var len: u8 = 1;
-
-        while (true) {
-            var i: usize = 0;
-            while (i < left) : (i += 1) {
-                code |= bit_buffer & 1;
-                bit_buffer >>= 1;
-
-                count = huffman_table.count[next_pos];
-                next_pos += 1;
-
+                // ugly casts
                 if (i32(code) - i32(count) < i32(first)) {
-                    state.bit_buffer = bit_buffer;
-                    state.bit_count = (state.bit_count - len) & 7;
                     return huffman_table.symbol[usize(i32(index) + i32(code) - i32(first))];
                 }
 
@@ -186,274 +167,315 @@ pub const InflateState = struct {
                 first += count;
                 first <<= 1;
                 code <<= 1;
-                len += 1;
             }
 
-            left = max_bits + 1 - len;
-            if (left == 0) {
-                break;
+            return error.RanOutOfHuffmanCodes;
+        }
+
+        pub fn decode2(state: &InflateState, huffman_table: &const HuffmanTable) !u16 {
+            // number of bits being decoded
+            var code: u16 = 0;
+            // first code of length len
+            var first: u16 = 0;
+            // number of codes of length len
+            var count: u16 = 0;
+            // index of first code of length len in symbol table
+            var index: usize = 0;
+
+            var bit_buffer = state.bit_buffer;
+            var left = state.bit_count;
+
+            var next_pos: usize = 1;
+            var len: u8 = 1;
+
+            while (true) {
+                var i: usize = 0;
+                while (i < left) : (i += 1) {
+                    code |= bit_buffer & 1;
+                    bit_buffer >>= 1;
+
+                    count = huffman_table.count[next_pos];
+                    next_pos += 1;
+
+                    if (i32(code) - i32(count) < i32(first)) {
+                        state.bit_buffer = bit_buffer;
+                        state.bit_count = (state.bit_count - len) & 7;
+                        return huffman_table.symbol[usize(i32(index) + i32(code) - i32(first))];
+                    }
+
+                    index += count;
+                    first += count;
+                    first <<= 1;
+                    code <<= 1;
+                    len += 1;
+                }
+
+                left = max_bits + 1 - len;
+                if (left == 0) {
+                    break;
+                }
+
+                var b: [1]u8 = undefined;
+                try state.input.read(b[0..]);
+                state.read_count += 1;
+
+                bit_buffer = b[0];
+
+                if (left > 8) {
+                    left = 8;
+                }
+
             }
 
-            if (state.read_count == state.input.len) {
+            return error.RanOutOfHuffmanCodes;
+        }
+
+        // Read huffman codes from the stream and decode until end of block.
+        fn decodeBlock(state: &InflateState, length: &const HuffmanTable, distance: &const HuffmanTable) !void {
+            // size base for length codes 257..285
+            const lens: [29]u16 = []const u16 {
+                3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+                35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+            };
+
+            // extra bits for length codes 257..285
+            const lext: [29]u4 = []const u4 {
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+                3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+            };
+
+            // offset base for distance codes 0..29
+            const dists: [30]u16 = []const u16 {
+                1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+                257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+                8193, 12289, 16385, 24577,
+            };
+
+            // extra bits for distance codes 0..29
+            const dext: [30]u4 = []const u4 {
+                0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+                7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+                12, 12, 13, 13,
+            };
+
+            while (true) {
+                var symbol = try state.decode(length);
+                if (symbol < 0) {
+                    return error.InvalidSymbol;
+                }
+
+                // literal
+                if (symbol < 256) {
+                    try state.output.writeByte(u8(symbol));
+                }
+                // length
+                else if (symbol > 256) {
+                    symbol -= 257;
+                    if (symbol >= 29) {
+                        return error.InvalidFixedCode;
+                    }
+
+                    const len = lens[symbol] + try state.readBits(lext[symbol]);
+                    symbol = try state.decode(distance);
+                    if (symbol < 0) {
+                        return error.InvalidSymbol;
+                    }
+
+                    const dist = dists[symbol] + try state.readBits(dext[symbol]);
+                    const output = state.output.toSliceConst();
+
+                    // Lookback into the output sliding window for the matching run
+                    const slice = state.output.windowSlice();
+                    const symbol_slice = slice[slice.len - dist .. slice.len - dist + len];
+
+                    try state.output.append(symbol_slice);
+                }
+                // end of block
+                else {
+                    break;
+                }
+            }
+        }
+
+        // A stored block is one stored with no compression. It can be copied directly to output
+        // provided a simple length check is maintained in the header.
+        pub fn decodeStored(state: &InflateState) !void {
+            state.bit_buffer = 0;
+            state.bit_count = 0;
+
+            var b: [4]u8 = undefined;
+            try state.input.read(b[0..]);
+            state.read_count += 4;
+
+            const l1 = b[0];
+            const l2 = b[1];
+            const l1_complement = b[2];
+            const l2_complement = b[3];
+
+            if (~l1 != l1_complement or ~l2 != l2_complement) {
+                return error.StoredLengthDoesNotMatchComplement;
+            }
+
+            const len = u16(l1) | (u16(l2) << 8);
+
+            if (state.read_count + len > state.input.len) {
                 return error.OutOfInput;
             }
 
-            bit_buffer = state.input[state.read_count];
-            state.read_count += 1;
+            // Read in chunks from input to output, pass from in to out len bytes
+            var i: usize = 0;
+            // do in chunks of os page size.
+            while (i < len) : (i += 1) {
+                var b2: [1]u8 = undefined;
+                try state.input.read(b2[0..]);
+                state.read_count += 1;
 
-            if (left > 8) {
-                left = 8;
+                try state.output.write(b2[0..]);
             }
-
         }
 
-        return error.RanOutOfHuffmanCodes;
-    }
+        // A fixed block is compressed but uses a fixed table as specified in the rfc. This is useful
+        // for short data segments where storing an optimal huffman table in the block would cause a
+        // greater overhead than using a slightly less optimal table.
+        pub fn decodeFixed(state: &InflateState) !void {
+            const literal_table = comptime block: {
+                @setEvalBranchQuota(2000);
 
-    // Read huffman codes from the stream and decode until end of block.
-    fn decodeBlock(state: &InflateState, length: &const HuffmanTable, distance: &const HuffmanTable) !void {
-        // size base for length codes 257..285
-        const lens: [29]u16 = []const u16 {
-            3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-            35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
-        };
-
-        // extra bits for length codes 257..285
-        const lext: [29]u4 = []const u4 {
-            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-            3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-        };
-
-        // offset base for distance codes 0..29
-        const dists: [30]u16 = []const u16 {
-            1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-            257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-            8193, 12289, 16385, 24577,
-        };
-
-        // extra bits for distance codes 0..29
-        const dext: [30]u4 = []const u4 {
-            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-            7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
-            12, 12, 13, 13,
-        };
-
-        while (true) {
-            var symbol = try state.decode(length);
-            if (symbol < 0) {
-                return error.InvalidSymbol;
-            }
-
-            // literal
-            if (symbol < 256) {
-                try state.output.append(u8(symbol));
-            }
-            // length
-            else if (symbol > 256) {
-                symbol -= 257;
-                if (symbol >= 29) {
-                    return error.InvalidFixedCode;
+                var lengths: [fix_lcodes]u16 = undefined;
+                {
+                    var i: usize = 0;
+                    while (i < 144) : (i += 1) {
+                        lengths[i] = 8;
+                    }
+                    while (i < 256) : (i += 1) {
+                        lengths[i] = 9;
+                    }
+                    while (i < 280) : (i += 1) {
+                        lengths[i] = 7;
+                    }
+                    while (i < fix_lcodes) : (i += 1) {
+                        lengths[i] = 8;
+                    }
                 }
 
-                const len = lens[symbol] + try state.readBits(lext[symbol]);
-                symbol = try state.decode(distance);
-                if (symbol < 0) {
-                    return error.InvalidSymbol;
-                }
+                break :block (HuffmanTable.init(lengths) catch unreachable);
+            };
 
-                const dist = dists[symbol] + try state.readBits(dext[symbol]);
-                const output = state.output.toSliceConst();
-
-                // TODO: bulk append
+            const distance_table = comptime block: {
+                var lengths: [max_dcodes]u16 = undefined;
                 var i: usize = 0;
-                while (i < len) : (i += 1) {
-                    const entry = state.output.at(state.output.len - dist);
-                    try state.output.append(entry);
+                while (i < max_dcodes) : (i += 1) {
+                    lengths[i] = 5;
                 }
+
+                break :block HuffmanTable.init(lengths) catch unreachable;
+            };
+
+            return state.decodeBlock(&literal_table, &distance_table);
+        }
+
+        // A dynamic block has the huffman tables embedded at the beginning. These tables are generated
+        // by the encoder to be as optimal as possible for each block.
+        pub fn decodeDynamic(state: &InflateState) !void {
+            const order: [19]u16 = []const u16 {
+                16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+            };
+
+            const nlen = (try state.readBits(5)) + 257;
+            const ndist = (try state.readBits(5)) + 1;
+            const ncode = (try state.readBits(4)) + 4;
+
+            if (nlen > max_lcodes or ndist > max_dcodes) {
+                return error.InvalidHuffmanTableLengths;
             }
-            // end of block
-            else {
-                break;
-            }
-        }
-    }
 
-    // A stored block is one stored with no compression. It can be copied directly to output
-    // provided a simple length check is maintained in the header.
-    pub fn decodeStored(state: &InflateState) !void {
-        state.bit_buffer = 0;
-        state.bit_count = 0;
-
-        if (state.read_count + 4 > state.input.len) {
-            return error.OutOfInput;
-        }
-
-        const l1 = state.readByte();
-        const l2 = state.readByte();
-        const l1_complement = state.readByte();
-        const l2_complement = state.readByte();
-
-        if (~l1 != l1_complement or ~l2 != l2_complement) {
-            return error.StoredLengthDoesNotMatchComplement;
-        }
-
-        const len = u16(l1) | (u16(l2) << 8);
-
-        if (state.read_count + len > state.input.len) {
-            return error.OutOfInput;
-        }
-
-        try state.output.appendSlice(state.input[state.read_count..state.read_count + len]);
-        state.read_count += len;
-    }
-
-    // A fixed block is compressed but uses a fixed table as specified in the rfc. This is useful
-    // for short data segments where storing an optimal huffman table in the block would cause a
-    // greater overhead than using a slightly less optimal table.
-    pub fn decodeFixed(state: &InflateState) !void {
-        const literal_table = comptime block: {
-            @setEvalBranchQuota(2000);
-
-            var lengths: [fix_lcodes]u16 = undefined;
+            // read code lengths
+            var lengths: [max_codes]u16 = undefined;
             {
                 var i: usize = 0;
-                while (i < 144) : (i += 1) {
-                    lengths[i] = 8;
+                while (i < ncode) : (i += 1) {
+                    lengths[order[i]] = try state.readBits(3);
                 }
-                while (i < 256) : (i += 1) {
-                    lengths[i] = 9;
-                }
-                while (i < 280) : (i += 1) {
-                    lengths[i] = 7;
-                }
-                while (i < fix_lcodes) : (i += 1) {
-                    lengths[i] = 8;
+                while (i < 19) : (i += 1) {
+                    lengths[order[i]] = 0;
                 }
             }
 
-            break :block (HuffmanTable.init(lengths) catch unreachable);
-        };
-
-        const distance_table = comptime block: {
-            var lengths: [max_dcodes]u16 = undefined;
-            var i: usize = 0;
-            while (i < max_dcodes) : (i += 1) {
-                lengths[i] = 5;
+            // TODO: Store complete status as a flag.
+            const length_table = try HuffmanTable.init(lengths[0..19]);
+            if (!length_table.is_complete) {
+                return error.DecodeTableIsNotComplete;
             }
 
-            break :block HuffmanTable.init(lengths) catch unreachable;
-        };
-
-        return state.decodeBlock(&literal_table, &distance_table);
-    }
-
-    // A dynamic block has the huffman tables embedded at the beginning. These tables are generated
-    // by the encoder to be as optimal as possible for each block.
-    pub fn decodeDynamic(state: &InflateState) !void {
-        const order: [19]u16 = []const u16 {
-            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-        };
-
-        const nlen = (try state.readBits(5)) + 257;
-        const ndist = (try state.readBits(5)) + 1;
-        const ncode = (try state.readBits(4)) + 4;
-
-        if (nlen > max_lcodes or ndist > max_dcodes) {
-            return error.InvalidHuffmanTableLengths;
-        }
-
-        // read code lengths
-        var lengths: [max_codes]u16 = undefined;
-        {
-            var i: usize = 0;
-            while (i < ncode) : (i += 1) {
-                lengths[order[i]] = try state.readBits(3);
-            }
-            while (i < 19) : (i += 1) {
-                lengths[order[i]] = 0;
-            }
-        }
-
-        // TODO: Store complete status as a flag.
-        const length_table = try HuffmanTable.init(lengths[0..19]);
-        if (!length_table.is_complete) {
-            return error.DecodeTableIsNotComplete;
-        }
-
-        // read length and distance tables
-        {
-            // last length to repeat
-            var len: u16 = 0;
-            var i: usize = 0;
-            while (i < nlen + ndist) {
-                var symbol = try state.decode(&length_table);
-                if (symbol < 0) {
-                    return error.InvalidSymbol;
-                }
-
-                // length in range of table
-                if (symbol < 16) {
-                    lengths[i] = symbol;
-                    i += 1;
-                }
-                // repeat instruction
-                else {
-                    len = 0;
-                    // repeat length 3..6 times
-                    if (symbol == 16) {
-                        if (i == 0) {
-                            return error.NoLastLength;
-                        }
-                        len = lengths[i - 1];
-                        symbol = 3 + try state.readBits(2);
-                    }
-                    // repeat zero 3..10 times
-                    else if (symbol == 17) {
-                        symbol = 3 + try state.readBits(3);
-                    }
-                    // repeat zero 11..138 times
-                    else {
-                        symbol = 11 + try state.readBits(7);
+            // read length and distance tables
+            {
+                // last length to repeat
+                var len: u16 = 0;
+                var i: usize = 0;
+                while (i < nlen + ndist) {
+                    var symbol = try state.decode(&length_table);
+                    if (symbol < 0) {
+                        return error.InvalidSymbol;
                     }
 
-                    if (i + symbol > nlen + ndist) {
-                        return error.TooManyLengths;
-                    }
-
-                    // repeat symbol
-                    var j: usize = 0;
-                    while (j < symbol) : (j += 1) {
-                        lengths[i] = len;
+                    // length in range of table
+                    if (symbol < 16) {
+                        lengths[i] = symbol;
                         i += 1;
                     }
+                    // repeat instruction
+                    else {
+                        len = 0;
+                        // repeat length 3..6 times
+                        if (symbol == 16) {
+                            if (i == 0) {
+                                return error.NoLastLength;
+                            }
+                            len = lengths[i - 1];
+                            symbol = 3 + try state.readBits(2);
+                        }
+                        // repeat zero 3..10 times
+                        else if (symbol == 17) {
+                            symbol = 3 + try state.readBits(3);
+                        }
+                        // repeat zero 11..138 times
+                        else {
+                            symbol = 11 + try state.readBits(7);
+                        }
+
+                        if (i + symbol > nlen + ndist) {
+                            return error.TooManyLengths;
+                        }
+
+                        // repeat symbol
+                        var j: usize = 0;
+                        while (j < symbol) : (j += 1) {
+                            lengths[i] = len;
+                            i += 1;
+                        }
+                    }
                 }
             }
+
+            if (lengths[256] == 0) {
+                return error.MissingEndOfBlockCode;
+            }
+
+            // huffman table for literal/length codes
+            // TODO: Huffman is ok for incomplete table here if single length 1 code.
+            const literal_table = try HuffmanTable.init(lengths[0..nlen]);
+
+            // huffman table for distance codes
+            const distance_table = try HuffmanTable.init(lengths[nlen..nlen+ndist]);
+
+            return state.decodeBlock(&literal_table, &distance_table);
         }
-
-        if (lengths[256] == 0) {
-            return error.MissingEndOfBlockCode;
-        }
-
-        // huffman table for literal/length codes
-        // TODO: Huffman is ok for incomplete table here if single length 1 code.
-        const literal_table = try HuffmanTable.init(lengths[0..nlen]);
-
-        // huffman table for distance codes
-        const distance_table = try HuffmanTable.init(lengths[nlen..nlen+ndist]);
-
-        return state.decodeBlock(&literal_table, &distance_table);
-    }
-};
-
-pub fn decompress(allocator: &Allocator, input: []const u8) !ArrayList(u8) {
-    var state = InflateState {
-        .output = ArrayList(u8).init(allocator),
-        .input = input,
-        .read_count = 0,
-        .bit_buffer = 0,
-        .bit_count = 0,
     };
-    errdefer state.output.deinit();
+}
+
+pub fn decompress(in_stream: var, out_stream: var) !void {
+    const InflateStateImpl = InflateState(in_stream.Error, @typeOf(out_stream).Error);
+    var state = InflateStateImpl(in_stream.stream, out_stream.stream);
 
     while (true) {
         const final = (try state.readBits(1)) != 0;
@@ -472,8 +494,18 @@ pub fn decompress(allocator: &Allocator, input: []const u8) !ArrayList(u8) {
             break;
         }
     }
+}
 
-    return state.output;
+pub fn decompressAlloc(allocator: &Allocator, input: []const u8) !Buffer {
+    var buffer = Buffer.initNull(allocator);
+    errdefer buffer.deinit();
+
+    var in_stream = custom_stream.MemoryInStream.init(input);
+    var out_stream = io.BufferOutStream.init(&buffer);
+
+    try decompress(in_stream, out_stream);
+
+    return buffer;
 }
 
 test "single block stored" {
@@ -484,7 +516,7 @@ test "single block stored" {
         "\xf7\xff" ++
         stored;
 
-    const result = try decompress(debug.global_allocator, data);
+    const result = try decompressAlloc(debug.global_allocator, data);
     debug.assert(mem.eql(u8, result.toSliceConst(), stored));
 }
 
@@ -508,7 +540,7 @@ test "single fixed" {
         "\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1" ++
         "\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff";
 
-    const result = try decompress(debug.global_allocator, data);
+    const result = try decompressAlloc(debug.global_allocator, data);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
 }
 
@@ -516,7 +548,7 @@ test "fuzz issue 1" {
     const expected = "\x28\x91\xe0\x7f\x90\x9f\xcc\x71\x6b\x1b";
     const compressed = "\xd3\x98\xf8\xa0\x7e\xc2\xfc\x33\x85\xd9\xd2\x00";
 
-    const result = try decompress(debug.global_allocator, compressed);
+    const result = try decompressAlloc(debug.global_allocator, compressed);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
 
 }
@@ -532,7 +564,7 @@ test "fuzz issue 2" {
     for (compressed) |e| std.debug.warn("{x} ", e);
     std.debug.warn("\n");
 
-    const result = try decompress(debug.global_allocator, compressed);
+    const result = try decompressAlloc(debug.global_allocator, compressed);
 
     std.debug.warn("zig gave us this:\n");
     for (result.toSliceConst()) |e| std.debug.warn("{x} ", e);
@@ -543,5 +575,4 @@ test "fuzz issue 2" {
     std.debug.warn("\n");
 
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
-
 }

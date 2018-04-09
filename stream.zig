@@ -153,28 +153,18 @@ pub fn SlidingWindowOutStream(comptime out_error: type, comptime window_size: us
             try self.base_out_stream.write(bytes);
 
             if (bytes.len + self.window_start + self.window_len >= 2 * window_size) {
-                std.debug.warn("exceeds double window\n");
                 if (bytes.len >= window_size) {
-                    std.debug.warn("full overwrite\n");
                     mem.copy(u8, self.window[0..window_size], bytes[bytes.len - window_size..]);
                 } else {
                     const amount_to_move = window_size - bytes.len;
-                    std.debug.warn("partial buffer shuffle to move {} and get {} new\n", amount_to_move, bytes.len);
-
-                    std.debug.warn("from, [{}..{}]\n", window_size * 2 - amount_to_move, window_size * 2);
-
-                    // TODO: This shuffle
-                    debug.assert(self.window_len >= amount_to_move);
-                    mem.copy(u8, self.window[0..amount_to_move], self.window[self.window_len - amount_to_move..self.window_len]);
-
-                    std.debug.warn("bytes to [{}..{}]\n", amount_to_move, window_size);
+                    const window_end = self.window_start + self.window_len;
+                    mem.copy(u8, self.window[0..amount_to_move], self.window[window_end - amount_to_move .. window_end]);
                     mem.copy(u8, self.window[amount_to_move..window_size], bytes[0..]);
                 }
 
                 self.window_start = 0;
                 self.window_len = window_size;
             } else {
-                std.debug.warn("less than, copy {} bytes to window[{}..]\n", bytes.len, self.window_start + self.window_len);
                 mem.copy(u8, self.window[self.window_start + self.window_len..], bytes);
 
                 self.window_len += bytes.len;
@@ -182,8 +172,6 @@ pub fn SlidingWindowOutStream(comptime out_error: type, comptime window_size: us
                     self.window_start += self.window_len - window_size;
                     self.window_len = window_size;
                 }
-
-                std.debug.warn("now window[{}..{}]\n", self.window_start, self.window_start + self.window_len);
             }
         }
     };
@@ -206,7 +194,6 @@ test "sliding window out stream" {
 
     // exceed double window
     try out_stream.stream.write("abcdefg");
-    for (out_stream.windowSlice()) |b| std.debug.warn("{c}\n", b);
     debug.assert(mem.eql(u8, out_stream.windowSlice(), "9abcdefg"));
 
     // full window overwrite
