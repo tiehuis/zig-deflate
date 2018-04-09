@@ -10,7 +10,7 @@ const mem = std.mem;
 const io = std.io;
 
 const Allocator = mem.Allocator;
-const Buffer = std.Buffer;
+const ArrayList = std.ArrayList;
 
 // Maximum bits in a huffman code.
 const max_bits = 15;
@@ -95,20 +95,21 @@ const custom_stream = @import("stream.zig");
 pub fn InflateState(comptime InError: type, comptime OutError: type) type {
     return struct {
         const Self = this;
-        const SlidingWindow = SlidingWindowOutStream(OutError, 1 << 15);
+        const SlidingWindow = custom_stream.SlidingWindowOutStream(OutError, 1 << 15);
 
         // Output stream which keeps a 32K sliding window for RLE decoding.
+        // TODO: Store the stream instance instead.
         output: SlidingWindow,
 
-        input: io.InStream(InError),
+        input: &io.InStream(InError),
         read_count: usize,
 
         bit_buffer: u16,
         bit_count: u8,
 
-        pub fn init(in_stream: io.InStream(Error), out_stream: io.OutStream(Error)) Self {
+        pub fn init(in_stream: &io.InStream(InError), out_stream: &io.OutStream(OutError)) Self {
             return Self {
-                .output = SlidingWindow.init(&out_stream),
+                .output = SlidingWindow.init(out_stream),
                 .input = in_stream,
                 .read_count = 0,
                 .bit_buffer = 0,
@@ -121,7 +122,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
             var val = state.bit_buffer;
             while (state.bit_count < need) {
                 var b: [1]u8 = undefined;
-                try state.input.read(b[0..]);
+                _ = try state.input.read(b[0..]);
                 state.read_count += 1;
 
                 val |= math.shl(u16, b[0], state.bit_count);
@@ -143,7 +144,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
         // Decode a single huffman code using the specified table from the stream.
         //
         // TODO: Use fast version.
-        pub fn decode(state: &InflateState, huffman_table: &const HuffmanTable) !u16 {
+        pub fn decode(state: &Self, huffman_table: &const HuffmanTable) !u16 {
             // number of bits being decoded
             var code: u16 = 0;
             // first code of length len
@@ -231,7 +232,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
         }
 
         // Read huffman codes from the stream and decode until end of block.
-        fn decodeBlock(state: &InflateState, length: &const HuffmanTable, distance: &const HuffmanTable) !void {
+        fn decodeBlock(state: &Self, length: &const HuffmanTable, distance: &const HuffmanTable) !void {
             // size base for length codes 257..285
             const lens: [29]u16 = []const u16 {
                 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
@@ -266,7 +267,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
 
                 // literal
                 if (symbol < 256) {
-                    try state.output.writeByte(u8(symbol));
+                    try state.output.stream.writeByte(u8(symbol));
                 }
                 // length
                 else if (symbol > 256) {
@@ -282,13 +283,12 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
                     }
 
                     const dist = dists[symbol] + try state.readBits(dext[symbol]);
-                    const output = state.output.toSliceConst();
 
                     // Lookback into the output sliding window for the matching run
                     const slice = state.output.windowSlice();
                     const symbol_slice = slice[slice.len - dist .. slice.len - dist + len];
 
-                    try state.output.append(symbol_slice);
+                    try state.output.stream.write(symbol_slice);
                 }
                 // end of block
                 else {
@@ -299,12 +299,12 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
 
         // A stored block is one stored with no compression. It can be copied directly to output
         // provided a simple length check is maintained in the header.
-        pub fn decodeStored(state: &InflateState) !void {
+        pub fn decodeStored(state: &Self) !void {
             state.bit_buffer = 0;
             state.bit_count = 0;
 
             var b: [4]u8 = undefined;
-            try state.input.read(b[0..]);
+            _ = try state.input.read(b[0..]);
             state.read_count += 4;
 
             const l1 = b[0];
@@ -318,26 +318,22 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
 
             const len = u16(l1) | (u16(l2) << 8);
 
-            if (state.read_count + len > state.input.len) {
-                return error.OutOfInput;
-            }
-
             // Read in chunks from input to output, pass from in to out len bytes
             var i: usize = 0;
-            // do in chunks of os page size.
+            // TODO: do in chunks of os page size.
             while (i < len) : (i += 1) {
                 var b2: [1]u8 = undefined;
-                try state.input.read(b2[0..]);
+                _ = try state.input.read(b2[0..]);
                 state.read_count += 1;
 
-                try state.output.write(b2[0..]);
+                try state.output.stream.write(b2[0..]);
             }
         }
 
         // A fixed block is compressed but uses a fixed table as specified in the rfc. This is useful
         // for short data segments where storing an optimal huffman table in the block would cause a
         // greater overhead than using a slightly less optimal table.
-        pub fn decodeFixed(state: &InflateState) !void {
+        pub fn decodeFixed(state: &Self) !void {
             const literal_table = comptime block: {
                 @setEvalBranchQuota(2000);
 
@@ -376,7 +372,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
 
         // A dynamic block has the huffman tables embedded at the beginning. These tables are generated
         // by the encoder to be as optimal as possible for each block.
-        pub fn decodeDynamic(state: &InflateState) !void {
+        pub fn decodeDynamic(state: &Self) !void {
             const order: [19]u16 = []const u16 {
                 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
             };
@@ -473,9 +469,10 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
     };
 }
 
-pub fn decompress(in_stream: var, out_stream: var) !void {
-    const InflateStateImpl = InflateState(in_stream.Error, @typeOf(out_stream).Error);
-    var state = InflateStateImpl(in_stream.stream, out_stream.stream);
+pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
+                  comptime OutError: type, out_stream: &io.OutStream(OutError)) !void {
+    const InflateStateImpl = InflateState(InError, OutError);
+    var state = InflateStateImpl.init(in_stream, out_stream);
 
     while (true) {
         const final = (try state.readBits(1)) != 0;
@@ -496,14 +493,15 @@ pub fn decompress(in_stream: var, out_stream: var) !void {
     }
 }
 
-pub fn decompressAlloc(allocator: &Allocator, input: []const u8) !Buffer {
-    var buffer = Buffer.initNull(allocator);
+pub fn decompressAlloc(allocator: &Allocator, input: []const u8) !ArrayList(u8) {
+    var buffer = ArrayList(u8).init(allocator);
     errdefer buffer.deinit();
 
     var in_stream = custom_stream.MemoryInStream.init(input);
-    var out_stream = io.BufferOutStream.init(&buffer);
+    var out_stream = custom_stream.GrowableMemoryOutStream.init(&buffer);
 
-    try decompress(in_stream, out_stream);
+    try decompress(custom_stream.MemoryInStream.Error, &in_stream.stream,
+                   custom_stream.GrowableMemoryOutStream.Error, &out_stream.stream);
 
     return buffer;
 }
@@ -560,19 +558,6 @@ test "fuzz issue 2" {
     const compressed =
         "\xeb\x3a\xd6\xf5\x44\xc2\xab\xe5\xeb\x8c\xa4\xdf\x26\x00";
 
-    std.debug.warn("\n");
-    for (compressed) |e| std.debug.warn("{x} ", e);
-    std.debug.warn("\n");
-
     const result = try decompressAlloc(debug.global_allocator, compressed);
-
-    std.debug.warn("zig gave us this:\n");
-    for (result.toSliceConst()) |e| std.debug.warn("{x} ", e);
-    std.debug.warn("\n");
-
-    std.debug.warn("\nbut we need this:\n");
-    for (expected) |e| std.debug.warn("{x} ", e);
-    std.debug.warn("\n");
-
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
 }
