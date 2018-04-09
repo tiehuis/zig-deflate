@@ -7,6 +7,7 @@ const std = @import("std");
 const debug = std.debug;
 const math = std.math;
 const mem = std.mem;
+const hash = std.hash;
 const io = std.io;
 
 const Allocator = mem.Allocator;
@@ -92,7 +93,7 @@ const custom_stream = @import("stream.zig");
 
 // comptime here for errors is slightly ugly, it would be great if we didn't need this and could
 // just runtime switch.
-pub fn InflateState(comptime InError: type, comptime OutError: type) type {
+pub fn InflateState(comptime InError: type, comptime OutError: type, comptime HashFunction: var) type {
     return struct {
         const Self = this;
         const SlidingWindow = custom_stream.SlidingWindowOutStream(OutError, 1 << 15);
@@ -104,6 +105,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
         input: &io.InStream(InError),
         read_count: usize,
 
+        hashfn: HashFunction,
+
         bit_buffer: u16,
         bit_count: u8,
 
@@ -112,6 +115,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
                 .output = SlidingWindow.init(out_stream),
                 .input = in_stream,
                 .read_count = 0,
+                .hashfn = HashFunction.init(),
                 .bit_buffer = 0,
                 .bit_count = 0,
             };
@@ -267,7 +271,9 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
 
                 // literal
                 if (symbol < 256) {
-                    try state.output.stream.writeByte(u8(symbol));
+                    var b: [1] u8 = []u8 { u8(symbol) };
+                    state.hashfn.update(b[0..]);
+                    try state.output.stream.write(b[0..]);
                 }
                 // length
                 else if (symbol > 256) {
@@ -288,6 +294,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
                     const slice = state.output.windowSlice();
                     const symbol_slice = slice[slice.len - dist .. slice.len - dist + len];
 
+                    state.hashfn.update(symbol_slice);
                     try state.output.stream.write(symbol_slice);
                 }
                 // end of block
@@ -326,6 +333,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
                 _ = try state.input.read(b2[0..]);
                 state.read_count += 1;
 
+                state.hashfn.update(b2[0..]);
                 try state.output.stream.write(b2[0..]);
             }
         }
@@ -470,8 +478,9 @@ pub fn InflateState(comptime InError: type, comptime OutError: type) type {
 }
 
 pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
-                  comptime OutError: type, out_stream: &io.OutStream(OutError)) !void {
-    const InflateStateImpl = InflateState(InError, OutError);
+                  comptime OutError: type, out_stream: &io.OutStream(OutError),
+                  comptime HashFunction: var) !u32 {
+    const InflateStateImpl = InflateState(InError, OutError, HashFunction);
     var state = InflateStateImpl.init(in_stream, out_stream);
 
     while (true) {
@@ -491,17 +500,19 @@ pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
             break;
         }
     }
+
+    return state.hashfn.final();
 }
 
-pub fn decompressAlloc(allocator: &Allocator, input: []const u8) !ArrayList(u8) {
+pub fn decompressAlloc(allocator: &Allocator, input: []const u8, comptime HashFunction: var) !ArrayList(u8) {
     var buffer = ArrayList(u8).init(allocator);
     errdefer buffer.deinit();
 
     var in_stream = custom_stream.MemoryInStream.init(input);
     var out_stream = custom_stream.GrowableMemoryOutStream.init(&buffer);
 
-    try decompress(custom_stream.MemoryInStream.Error, &in_stream.stream,
-                   custom_stream.GrowableMemoryOutStream.Error, &out_stream.stream);
+    _ = try decompress(custom_stream.MemoryInStream.Error, &in_stream.stream,
+                   custom_stream.GrowableMemoryOutStream.Error, &out_stream.stream, HashFunction);
 
     return buffer;
 }
@@ -514,7 +525,7 @@ test "single block stored" {
         "\xf7\xff" ++
         stored;
 
-    const result = try decompressAlloc(debug.global_allocator, data);
+    const result = try decompressAlloc(debug.global_allocator, data, hash.Adler32);
     debug.assert(mem.eql(u8, result.toSliceConst(), stored));
 }
 
@@ -538,7 +549,7 @@ test "single fixed" {
         "\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1" ++
         "\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff";
 
-    const result = try decompressAlloc(debug.global_allocator, data);
+    const result = try decompressAlloc(debug.global_allocator, data, hash.Adler32);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
 }
 
@@ -546,7 +557,7 @@ test "fuzz issue 1" {
     const expected = "\x28\x91\xe0\x7f\x90\x9f\xcc\x71\x6b\x1b";
     const compressed = "\xd3\x98\xf8\xa0\x7e\xc2\xfc\x33\x85\xd9\xd2\x00";
 
-    const result = try decompressAlloc(debug.global_allocator, compressed);
+    const result = try decompressAlloc(debug.global_allocator, compressed, hash.Adler32);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
 
 }
@@ -558,6 +569,6 @@ test "fuzz issue 2" {
     const compressed =
         "\xeb\x3a\xd6\xf5\x44\xc2\xab\xe5\xeb\x8c\xa4\xdf\x26\x00";
 
-    const result = try decompressAlloc(debug.global_allocator, compressed);
+    const result = try decompressAlloc(debug.global_allocator, compressed, hash.Adler32);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
 }
