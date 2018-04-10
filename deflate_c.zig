@@ -3,7 +3,7 @@ const hash = std.hash;
 const deflate = @import("deflate.zig");
 
 // max decompress is 4096
-var c_output: [8192 * 1024]u8 = undefined;
+var c_output: [3 * 40960 + 1024]u8 = undefined;
 
 export fn zig_decompress(in: &const u8, inlen: usize, out: &u8, outlen: &usize) c_int {
     // use a fixed buffer allocator to avoid allocating in the loop

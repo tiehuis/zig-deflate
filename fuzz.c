@@ -9,7 +9,6 @@
 #include <time.h>
 #include <zlib.h>
 
-// points to a static buffer valid till next call
 extern int zig_decompress(const uint8_t *input, size_t inlen, uint8_t *output, size_t *outlen);
 
 void print_buffer(const uint8_t *buf, size_t len)
@@ -24,8 +23,8 @@ int main(void)
 {
     srand(time(NULL));
 
-    uint8_t in_buffer[4096];
-    uint8_t out_buffer[4096 + 512]; // 0.1% larger plus 12
+    uint8_t in_buffer[40960];
+    uint8_t out_buffer[40960 + 512]; // 0.1% larger plus 12
 
     uint64_t rounds = 0;
 
