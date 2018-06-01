@@ -49,8 +49,8 @@ const HuffmanTable = struct {
     // We require a stack-allocated array to stored symbols since each huffman tree may vary
     // in the number of symbols it encodes. This must live at least as longer as the returned table.
     pub fn init(lengths: []const u16) !HuffmanTable {
-        var h = HuffmanTable {
-            .count = []const u16 {0} ** (max_bits + 1),
+        var h = HuffmanTable{
+            .count = []const u16{0} ** (max_bits + 1),
             .symbol = undefined,
             .symbol_len = lengths.len,
             .is_complete = false,
@@ -104,19 +104,19 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
         const InflateSlidingWindow = SlidingWindowOutStream(OutError, 1 << 15);
 
         wrapped_out_stream: InflateSlidingWindow,
-        out_stream: &OutStream(OutError),
+        out_stream: *OutStream(OutError),
         hasher: Hasher,
 
-        in_stream: &InStream(InError),
+        in_stream: *InStream(InError),
         in_count: usize,
 
         bit_buffer: u16,
         bit_count: u8,
 
-        pub fn init(in_stream: &InStream(InError), out_stream: &OutStream(OutError)) Self {
+        pub fn init(in_stream: *InStream(InError), out_stream: *OutStream(OutError)) Self {
             var wrapped_out_stream = InflateSlidingWindow.init(out_stream);
 
-            return Self {
+            return Self{
                 .wrapped_out_stream = wrapped_out_stream,
                 .out_stream = &wrapped_out_stream.stream,
                 .hasher = Hasher.init(),
@@ -130,7 +130,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
         }
 
         // Read individual unaligned bits from the input stream.
-        pub fn readBits(state: &Self, need: u4) !u16 {
+        pub fn readBits(state: *Self, need: u4) !u16 {
             var val = state.bit_buffer;
             while (state.bit_count < need) {
                 var b: [1]u8 = undefined;
@@ -148,14 +148,14 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
         }
 
         // Read a byte without error. Assumes there is sufficient bytes on the stream.
-        pub fn readByte(state: &Self) u8 {
+        pub fn readByte(state: *Self) u8 {
             return u8(state.readBits(8) catch unreachable);
         }
 
         // Decode a single huffman code using the specified table from the stream.
         //
         // TODO: Use fast version.
-        pub fn decode(state: &Self, huffman_table: &const HuffmanTable) !u16 {
+        pub fn decode(state: *Self, huffman_table: *const HuffmanTable) !u16 {
             // number of bits being decoded
             var code: u16 = 0;
             // first code of length len
@@ -184,7 +184,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
             return error.RanOutOfHuffmanCodes;
         }
 
-        pub fn decode2(state: &InflateState, huffman_table: &const HuffmanTable) !u16 {
+        pub fn decode2(state: *InflateState, huffman_table: *const HuffmanTable) !u16 {
             // number of bits being decoded
             var code: u16 = 0;
             // first code of length len
@@ -236,38 +236,35 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
                 if (left > 8) {
                     left = 8;
                 }
-
             }
 
             return error.RanOutOfHuffmanCodes;
         }
 
         // Read huffman codes from the stream and decode until end of block.
-        fn decodeBlock(state: &Self, length: &const HuffmanTable, distance: &const HuffmanTable) !void {
+        fn decodeBlock(state: *Self, length: *const HuffmanTable, distance: *const HuffmanTable) !void {
             // size base for length codes 257..285
-            const lens: [29]u16 = []const u16 {
+            const lens: [29]u16 = []const u16{
                 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
                 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
             };
 
             // extra bits for length codes 257..285
-            const lext: [29]u4 = []const u4 {
+            const lext: [29]u4 = []const u4{
                 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
                 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
             };
 
             // offset base for distance codes 0..29
-            const dists: [30]u16 = []const u16 {
+            const dists: [30]u16 = []const u16{
                 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-                257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-                8193, 12289, 16385, 24577,
+                257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
             };
 
             // extra bits for distance codes 0..29
-            const dext: [30]u4 = []const u4 {
+            const dext: [30]u4 = []const u4{
                 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-                7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
-                12, 12, 13, 13,
+                7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
             };
 
             while (true) {
@@ -278,7 +275,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
 
                 // literal
                 if (symbol < 256) {
-                    var b: [1] u8 = []u8 { u8(symbol) };
+                    var b: [1]u8 = []u8{u8(symbol)};
                     try state.out_stream.write(b[0..]);
                     state.hasher.update(b[0..]);
                 }
@@ -313,7 +310,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
 
         // A stored block is one stored with no compression. It can be copied directly to output
         // provided a simple length check is maintained in the header.
-        pub fn decodeStored(state: &Self) !void {
+        pub fn decodeStored(state: *Self) !void {
             state.bit_buffer = 0;
             state.bit_count = 0;
 
@@ -348,7 +345,7 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
         // A fixed block is compressed but uses a fixed table as specified in the rfc. This is useful
         // for short data segments where storing an optimal huffman table in the block would cause a
         // greater overhead than using a slightly less optimal table.
-        pub fn decodeFixed(state: &Self) !void {
+        pub fn decodeFixed(state: *Self) !void {
             const literal_table = comptime block: {
                 @setEvalBranchQuota(2000);
 
@@ -387,8 +384,8 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
 
         // A dynamic block has the huffman tables embedded at the beginning. These tables are
         // generated by the encoder to be as optimal as possible for each block.
-        pub fn decodeDynamic(state: &Self) !void {
-            const order: [19]u16 = []const u16 {
+        pub fn decodeDynamic(state: *Self) !void {
+            const order: [19]u16 = []const u16{
                 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
             };
 
@@ -477,16 +474,20 @@ pub fn InflateState(comptime InError: type, comptime OutError: type, comptime Ha
             const literal_table = try HuffmanTable.init(lengths[0..nlen]);
 
             // huffman table for distance codes
-            const distance_table = try HuffmanTable.init(lengths[nlen..nlen+ndist]);
+            const distance_table = try HuffmanTable.init(lengths[nlen .. nlen + ndist]);
 
             return state.decodeBlock(&literal_table, &distance_table);
         }
     };
 }
 
-pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
-                  comptime OutError: type, out_stream: &io.OutStream(OutError),
-                  comptime Hasher: var) !u32 {
+pub fn decompress(
+    comptime InError: type,
+    in_stream: *io.InStream(InError),
+    comptime OutError: type,
+    out_stream: *io.OutStream(OutError),
+    comptime Hasher: var,
+) !u32 {
     const InflateStateImpl = InflateState(InError, OutError, Hasher);
     var state = InflateStateImpl.init(in_stream, out_stream);
 
@@ -511,24 +512,22 @@ pub fn decompress(comptime InError: type, in_stream: &io.InStream(InError),
     return state.hasher.final();
 }
 
-pub fn decompressAlloc(allocator: &Allocator, input: []const u8, comptime Hasher: var) !ArrayList(u8) {
+pub fn decompressAlloc(allocator: *Allocator, input: []const u8, comptime Hasher: var) !ArrayList(u8) {
     var buffer = ArrayList(u8).init(allocator);
     errdefer buffer.deinit();
 
     var in_stream = MemoryInStream.init(input);
     var out_stream = MemoryOutStream.init(&buffer);
 
-    _ = try decompress(MemoryInStream.Error, &in_stream.stream,
-                       MemoryOutStream.Error, &out_stream.stream, Hasher);
+    _ = try decompress(MemoryInStream.Error, &in_stream.stream, MemoryOutStream.Error, &out_stream.stream, Hasher);
 
     return buffer;
 }
 
 test "single block stored" {
     const stored = "\x00\x01\x02\x03\x04\x05\x06\x07";
-    const data =
-        "\x01" ++       // last block, stored
-        "\x08\x00" ++   // 8 bytes len
+    const data = "\x01" ++ // last block, stored
+        "\x08\x00" ++ // 8 bytes len
         "\xf7\xff" ++
         stored;
 
@@ -538,10 +537,10 @@ test "single block stored" {
 
 test "single fixed" {
     var expected: [256]u8 = undefined;
-    for (expected) |*b, i| *b = @truncate(u8, i);
+    for (expected) |*b, i|
+        b.* = @truncate(u8, i);
 
-    const data =
-        "\x01\x00\x01\xff\xfe\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d" ++
+    const data = "\x01\x00\x01\xff\xfe\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d" ++
         "\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20" ++
         "\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33" ++
         "\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46" ++
@@ -566,15 +565,12 @@ test "fuzz issue 1" {
 
     const result = try decompressAlloc(debug.global_allocator, compressed, hash.Adler32);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));
-
 }
 
 test "fuzz issue 2" {
-    const expected =
-        "\x8a\xc6\x8a\xe4\x18\x4a\x84\xf5\x98\x62\xfb\x34";
+    const expected = "\x8a\xc6\x8a\xe4\x18\x4a\x84\xf5\x98\x62\xfb\x34";
 
-    const compressed =
-        "\xeb\x3a\xd6\xf5\x44\xc2\xab\xe5\xeb\x8c\xa4\xdf\x26\x00";
+    const compressed = "\xeb\x3a\xd6\xf5\x44\xc2\xab\xe5\xeb\x8c\xa4\xdf\x26\x00";
 
     const result = try decompressAlloc(debug.global_allocator, compressed, hash.Adler32);
     debug.assert(mem.eql(u8, result.toSliceConst(), expected));

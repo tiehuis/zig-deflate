@@ -17,16 +17,14 @@ pub const MemoryInStream = struct {
     pub const Stream = InStream(Error);
 
     pub fn init(buffer: []const u8) MemoryInStream {
-        return MemoryInStream {
+        return MemoryInStream{
             .buffer = buffer,
             .position = 0,
-            .stream = Stream {
-                .readFn = readFn,
-            },
+            .stream = Stream{ .readFn = readFn },
         };
     }
 
-    fn readFn(in_stream: &Stream, buffer: []u8) Error!usize {
+    fn readFn(in_stream: *Stream, buffer: []u8) Error!usize {
         const self = @fieldParentPtr(MemoryInStream, "stream", in_stream);
 
         if (self.position >= self.buffer.len) {
@@ -58,22 +56,20 @@ test "memory in stream" {
 }
 
 pub const MemoryOutStream = struct {
-    buffer: &ArrayList(u8),
+    buffer: *ArrayList(u8),
     stream: Stream,
 
     pub const Error = error{OutOfMemory};
     pub const Stream = OutStream(Error);
 
-    pub fn init(buffer: &ArrayList(u8)) MemoryOutStream {
-        return MemoryOutStream {
+    pub fn init(buffer: *ArrayList(u8)) MemoryOutStream {
+        return MemoryOutStream{
             .buffer = buffer,
-            .stream = Stream {
-                .writeFn = writeFn,
-            },
+            .stream = Stream{ .writeFn = writeFn },
         };
     }
 
-    fn writeFn(out_stream: &Stream, bytes: []const u8) Error!void {
+    fn writeFn(out_stream: *Stream, bytes: []const u8) Error!void {
         const self = @fieldParentPtr(MemoryOutStream, "stream", out_stream);
         return self.buffer.appendSlice(bytes);
     }
@@ -105,53 +101,51 @@ pub fn SlidingWindowOutStream(comptime out_error: type, comptime window_size: us
         // Index to start of window slice. window_start < window_size.
         window_start: usize,
 
-        base_out_stream: &Stream,
+        base_out_stream: *Stream,
         stream: Stream,
 
         pub const Error = out_error;
         pub const Stream = io.OutStream(Error);
 
-        pub fn init(base_out_stream: &Stream) Self {
-            return Self {
+        pub fn init(base_out_stream: *Stream) Self {
+            return Self{
                 .window = undefined,
                 .window_len = 0,
                 .window_start = 0,
 
                 .base_out_stream = base_out_stream,
-                .stream = Stream {
-                    .writeFn = writeFn,
-                },
+                .stream = Stream{ .writeFn = writeFn },
             };
         }
 
-        pub fn windowSlice(self: &Self) []const u8 {
+        pub fn windowSlice(self: *Self) []const u8 {
             return self.window[self.window_start .. self.window_start + self.window_len];
         }
 
-        pub fn clearWindow(self: &Self) void {
+        pub fn clearWindow(self: *Self) void {
             self.window_len = 0;
             self.window_start = 0;
         }
 
-        fn writeFn(out_stream: &Stream, bytes: []const u8) !void {
+        fn writeFn(out_stream: *Stream, bytes: []const u8) !void {
             const self = @fieldParentPtr(Self, "stream", out_stream);
 
             try self.base_out_stream.write(bytes);
 
             if (bytes.len + self.window_start + self.window_len >= 2 * window_size) {
                 if (bytes.len >= window_size) {
-                    mem.copy(u8, self.window[0..window_size], bytes[bytes.len - window_size..]);
+                    mem.copy(u8, self.window[0..window_size], bytes[bytes.len - window_size ..]);
                 } else {
                     const amount_to_move = window_size - bytes.len;
                     const window_end = self.window_start + self.window_len;
-                    mem.copy(u8, self.window[0..amount_to_move], self.window[window_end - amount_to_move..window_end]);
+                    mem.copy(u8, self.window[0..amount_to_move], self.window[window_end - amount_to_move .. window_end]);
                     mem.copy(u8, self.window[amount_to_move..window_size], bytes[0..]);
                 }
 
                 self.window_start = 0;
                 self.window_len = window_size;
             } else {
-                mem.copy(u8, self.window[self.window_start + self.window_len..], bytes);
+                mem.copy(u8, self.window[self.window_start + self.window_len ..], bytes);
 
                 self.window_len += bytes.len;
                 if (self.window_len > window_size) {
